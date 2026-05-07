@@ -470,10 +470,18 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
         kwargs = dict(tokenize=False, add_generation_prompt=True)
         if tools_arg:
             kwargs["tools"] = tools_arg
+            # Thinking mode conflicts with tool-call format compliance: the model
+            # reasons freely inside <think> and then generates its own XML format
+            # (e.g. <Bash>) instead of the <tool_call> format the template requires.
+            # Force thinking off whenever tools are present unless the caller
+            # explicitly opts back in via chat_template_kwargs.
+            kwargs["enable_thinking"] = False
         # Per-request chat template knobs (e.g. enable_thinking, preserve_thinking).
         if req.chat_template_kwargs:
             kwargs.update(req.chat_template_kwargs)
         prompt = tokenizer.apply_chat_template(msgs, **kwargs)
+        if os.environ.get("DFLASH_DEBUG_PROMPT"):
+            print("\n=== RENDERED PROMPT ===\n" + prompt[-3000:] + "\n=== END PROMPT ===", file=sys.stderr, flush=True)
         # Did the template prefill `<think>\n` at the end? Then streaming should
         # start in reasoning mode.
         started_in_thinking = bool(re.search(r"<think>\s*$", prompt))
@@ -511,6 +519,8 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatRequest):
+        if os.environ.get("DFLASH_DEBUG_PROMPT"):
+            print(f"\n=== TOOLS RECEIVED: {[t.function.get('name') if isinstance(t.function, dict) else t.function for t in (req.tools or [])]} ===", file=sys.stderr, flush=True)
         prompt_bin, started_in_thinking = _tokenize_prompt(req)
         prompt_len = prompt_bin.stat().st_size // 4
 

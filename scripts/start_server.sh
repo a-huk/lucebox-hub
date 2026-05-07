@@ -17,6 +17,12 @@ MAX_CTX=${MAX_CTX:-262144}
 REPO=/home/hukad/specprefill/lucebox-hub/dflash
 MODELS=/home/hukad/specprefill/models
 
+if ! podman inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true; then
+  echo "Starting container $CONTAINER..."
+  podman start "$CONTAINER"
+  sleep 5
+fi
+
 podman exec -it "$CONTAINER" bash -c "
   cd $REPO/scripts
 
@@ -24,7 +30,7 @@ podman exec -it "$CONTAINER" bash -c "
   # --prefill-compression != off; we only need the extras here.
   export DFLASH_FP_LOOKAHEAD=64
 
-  python3 server.py \
+  python3 server_tools.py \
     --bin    $REPO/build-hip-phase2/test_dflash \
     --target $MODELS/Qwen3.6-27B-UD-Q4_K_XL.gguf \
     --draft  $MODELS/draft_3.6 \
