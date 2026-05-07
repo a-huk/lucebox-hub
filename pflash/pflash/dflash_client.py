@@ -22,8 +22,8 @@ class DflashClient:
                  fa_window: Optional[int] = None,
                  kv_tq3: Optional[bool] = None,
                  lm_head_fix: Optional[bool] = None,
-                 boot_timeout_s: float = 60.0,
-                 boot_vram_mib: int = 18000):
+                 boot_timeout_s: float = 90.0,
+                 boot_vram_mib: int = 13000):
         """Spawn the patched dflash daemon as a subprocess.
 
         Defaults for fa_window / kv_tq3 / lm_head_fix come from
@@ -54,6 +54,9 @@ class DflashClient:
             cmd.append(f"--ddtree-temp={ddtree_temp}")
         if not chain_seed:
             cmd.append("--ddtree-no-chain-seed")
+        # Capture free memory baseline before spawning — used by _read_vram_used_mib()
+        # to measure actual GPU memory consumption on unified memory APUs.
+        self._initial_hip_free_mib = self._hip_free_mib()
         log.info("spawning dflash daemon: %s", " ".join(cmd))
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                      pass_fds=(self.w_pipe,), env=env)
@@ -62,21 +65,63 @@ class DflashClient:
         # Park draft by default; user calls unpark when needed
         self._send("park draft\n")
 
-    def _wait_until_loaded(self, timeout: float = 60.0, vram_mib: int = 18000):
+    @staticmethod
+    def _hip_free_mib() -> int:
+        """Free GPU memory in MiB via hipMemGetInfo. Reliable on AMD unified memory APUs
+        where rocm-smi only reports the small dedicated VRAM segment (~512MB on Strix Halo)."""
+        try:
+            import ctypes
+            hip = ctypes.CDLL("libamdhip64.so")
+            free = ctypes.c_size_t(0)
+            total = ctypes.c_size_t(0)
+            hip.hipMemGetInfo(ctypes.byref(free), ctypes.byref(total))
+            return int(free.value // (1024 * 1024))
+        except Exception:
+            return 0
+
+    def _read_vram_used_mib(self) -> int:
+        """Return GPU memory used in MiB since daemon was spawned.
+
+        On AMD unified memory (Strix Halo): hipMemGetInfo.free drops as the
+        model loads — we measure used = initial_free - current_free.
+        rocm-smi only reports the tiny dedicated VRAM (~512MB), not useful here.
+        On NVIDIA: fall back to nvidia-smi.
+        """
+        # hipMemGetInfo delta approach — works on unified memory AMD APUs
+        hip_free = self._hip_free_mib()
+        if hip_free > 0 and self._initial_hip_free_mib > 0:
+            used = self._initial_hip_free_mib - hip_free
+            if used > 0:
+                return used
+        # rocm-smi (dedicated VRAM, unreliable on APUs but harmless to try)
+        try:
+            out = subprocess.check_output(
+                ["rocm-smi", "--showmeminfo", "vram", "--noheader"],
+                stderr=subprocess.DEVNULL).decode()
+            used_line = next(l for l in out.splitlines() if "Used Memory" in l)
+            return int(used_line.split()[-1]) // (1024 * 1024)
+        except Exception:
+            pass
+        # nvidia-smi fallback (NVIDIA GPUs)
+        try:
+            return int(subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=memory.used",
+                 "--format=csv,noheader,nounits"]).decode().splitlines()[0])
+        except Exception:
+            return 0
+
+    def _wait_until_loaded(self, timeout: float = 120.0, vram_mib: int = 14000):
         boot = time.time()
         while time.time() - boot < timeout:
-            time.sleep(1)
+            time.sleep(2)
             try:
-                vram = int(subprocess.check_output(
-                    ["nvidia-smi", "--query-gpu=memory.used",
-                     "--format=csv,noheader,nounits"]).decode().splitlines()[0])
-                if vram > vram_mib:
+                if self._read_vram_used_mib() > vram_mib:
                     return
             except Exception:
                 pass
         raise RuntimeError(
             f"dflash daemon failed to load target weights within {timeout:.0f}s "
-            f"(expected VRAM > {vram_mib} MiB). Check the daemon's stderr.")
+            f"(expected memory increase > {vram_mib} MiB). Check the daemon's stderr.")
 
     def _send(self, cmd: str):
         self.proc.stdin.write(cmd.encode())

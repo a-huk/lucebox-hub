@@ -1689,8 +1689,11 @@ int main(int argc, char ** argv) {
                 }
 
                 float keep = (float)keep_x1000 / 1000.0f;
+                int fp_lookahead = 8;
+                if (const char * s = std::getenv("DFLASH_FP_LOOKAHEAD"))
+                    fp_lookahead = std::atoi(s);
                 auto compressed = dflash27b::drafter_score_and_compress(
-                    drafter_ctx, src_ids, keep);
+                    drafter_ctx, src_ids, keep, 32, fp_lookahead);
                 std::printf("[compress] %zu -> %zu tokens (keep_ratio=%.3f)\n",
                             src_ids.size(), compressed.size(), keep);
                 std::fflush(stdout);

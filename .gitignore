@@ -51,6 +51,10 @@ env/
 # macOS / OS
 .DS_Store
 
+# HIP build directories
+build-hip/
+build-hip-phase2/
+
 # Benchmark artifacts (keep RESULTS.md, drop raw dumps)
 *.nsys-rep
 *.qdrep

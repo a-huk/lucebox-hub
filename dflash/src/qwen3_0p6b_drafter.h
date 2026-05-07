@@ -87,6 +87,7 @@ bool forward_qwen3_0p6b_drafter(
     const Qwen3DrafterWeights & w,
     const std::vector<int32_t> & ids,
     int n_lookahead,
-    std::vector<float> & running_max);
+    std::vector<float> & running_max,
+    std::vector<float> & norm_scores);  // per-token ||h||^2 from final hidden state
 
 } // namespace dflash27b

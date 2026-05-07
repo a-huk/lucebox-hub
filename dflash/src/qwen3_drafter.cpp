@@ -102,7 +102,8 @@ std::vector<int32_t> drafter_score_and_compress(
     // ── 1. Custom forward + GPU tail-attention scoring ────────────────
     auto t0 = std::chrono::steady_clock::now();
     std::vector<float> running_max;
-    if (!forward_qwen3_0p6b_drafter(ctx.weights, ids, n_lookahead, running_max)) {
+    std::vector<float> norm_scores;
+    if (!forward_qwen3_0p6b_drafter(ctx.weights, ids, n_lookahead, running_max, norm_scores)) {
         return {};
     }
     auto t1 = std::chrono::steady_clock::now();
@@ -118,6 +119,26 @@ std::vector<int32_t> drafter_score_and_compress(
             s += running_max[(size_t)t * S + j];
         }
         score[j] = s / (float)n_lookahead;
+    }
+
+    // ── 2b. Optional blend with hidden-state norm score ───────────────
+    // DFLASH_FP_NORM_WEIGHT=0..1 blends ||h[j]||^2 into the attention score.
+    // Both signals are normalized to [0,1] before blending so the weight is
+    // interpretable regardless of scale. nw=1.0 = pure norm, nw=0.0 = pure attn.
+    if (const char * nw_str = std::getenv("DFLASH_FP_NORM_WEIGHT")) {
+        float nw = std::max(0.0f, std::min(1.0f, (float)std::atof(nw_str)));
+        if (nw > 0.0f && (int)norm_scores.size() == S) {
+            float a_min = *std::min_element(score.begin(), score.end());
+            float a_max = *std::max_element(score.begin(), score.end());
+            float n_min = *std::min_element(norm_scores.begin(), norm_scores.end());
+            float n_max = *std::max_element(norm_scores.begin(), norm_scores.end());
+            float a_rng = a_max - a_min, n_rng = n_max - n_min;
+            for (int j = 0; j < S; ++j) {
+                float na = (a_rng > 0.0f) ? (score[j]       - a_min) / a_rng : 0.0f;
+                float nn = (n_rng > 0.0f) ? (norm_scores[j]  - n_min) / n_rng : 0.0f;
+                score[j] = (1.0f - nw) * na + nw * nn;
+            }
+        }
     }
 
     // ── 3. AvgPool 1D smoothing ───────────────────────────────────────
@@ -145,10 +166,22 @@ std::vector<int32_t> drafter_score_and_compress(
         m /= std::max(1, e_ - s_);
         chunk_means.push_back({m, c});
     }
-    std::partial_sort(chunk_means.begin(),
-                      chunk_means.begin() + n_keep,
-                      chunk_means.end(),
-                      [](auto a, auto b) { return a.first > b.first; });
+    // Sort all chunks by score descending for selection and optional debug print.
+    std::sort(chunk_means.begin(), chunk_means.end(),
+              [](auto a, auto b) { return a.first > b.first; });
+    if (std::getenv("DFLASH_FP_CHUNK_DEBUG")) {
+        int print_n = std::min(n_keep + 5, n_chunks);
+        std::fprintf(stderr, "[chunk-debug] top %d of %d chunks (chunk_size=%d):\n",
+                     print_n, n_chunks, chunk_size);
+        for (int i = 0; i < print_n; ++i) {
+            std::fprintf(stderr, "  rank%3d  chunk%4d  pos%6d..%6d  score=%.6f\n",
+                         i, chunk_means[i].second,
+                         chunk_means[i].second * chunk_size,
+                         std::min(S, (chunk_means[i].second + 1) * chunk_size) - 1,
+                         chunk_means[i].first);
+        }
+        std::fflush(stderr);
+    }
     std::vector<int> selected;
     selected.reserve((size_t)n_keep);
     for (int i = 0; i < n_keep; ++i) selected.push_back(chunk_means[i].second);

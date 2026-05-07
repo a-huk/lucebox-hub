@@ -102,7 +102,8 @@ bool forward_qwen3_0p6b_drafter(
     const Qwen3DrafterWeights & w,
     const std::vector<int32_t> & ids,
     int n_lookahead,
-    std::vector<float> & running_max)
+    std::vector<float> & running_max,
+    std::vector<float> & norm_scores)
 {
     if (!w.backend || !w.tok_embd) {
         set_last_error("forward_qwen3_0p6b_drafter: weights not loaded");
@@ -126,6 +127,7 @@ bool forward_qwen3_0p6b_drafter(
 
     PersBuf hidden_buf, pos_buf, mask_tail_buf, Q_buf, attn_out_buf;
     std::vector<PersBuf> K_curr_v((size_t)w.n_layer);
+    std::vector<PersBuf> K_norope_v((size_t)w.n_layer);  // pre-RoPE K for NoPE tail-score
     std::vector<PersBuf> V_curr_v((size_t)w.n_layer);
     std::vector<PersBuf> Q_last_v((size_t)w.n_layer);
     auto cleanup_all = [&]() {
@@ -134,9 +136,10 @@ bool forward_qwen3_0p6b_drafter(
         free_pers(mask_tail_buf);
         free_pers(Q_buf);
         free_pers(attn_out_buf);
-        for (auto & p : K_curr_v) free_pers(p);
-        for (auto & p : V_curr_v) free_pers(p);
-        for (auto & p : Q_last_v) free_pers(p);
+        for (auto & p : K_curr_v)   free_pers(p);
+        for (auto & p : K_norope_v) free_pers(p);
+        for (auto & p : V_curr_v)   free_pers(p);
+        for (auto & p : Q_last_v)   free_pers(p);
     };
 
     {
@@ -163,10 +166,11 @@ bool forward_qwen3_0p6b_drafter(
             return false;
         }
         for (int il = 0; il < w.n_layer; ++il) {
-            if (!make_pers(w.backend, half_type, 3, d_kv, K_curr_v[il]) ||
-                !make_pers(w.backend, half_type, 3, d_kv, V_curr_v[il]) ||
+            if (!make_pers(w.backend, half_type, 3, d_kv, K_curr_v[il])   ||
+                !make_pers(w.backend, half_type, 3, d_kv, K_norope_v[il]) ||
+                !make_pers(w.backend, half_type, 3, d_kv, V_curr_v[il])   ||
                 !make_pers(w.backend, GGML_TYPE_F32, 3, d_ql, Q_last_v[il])) {
-                set_last_error("forward_qwen3_0p6b: K_curr/V_curr/Q_last alloc failed at layer " + std::to_string(il));
+                set_last_error("forward_qwen3_0p6b: K_curr/K_norope/V_curr/Q_last alloc failed at layer " + std::to_string(il));
                 cleanup_all();
                 return false;
             }
@@ -275,9 +279,6 @@ bool forward_qwen3_0p6b_drafter(
             K = ggml_reshape_3d(gA, K, D, Hk, cl);
             K = ggml_rms_norm(gA, K, eps);
             K = ggml_mul(gA, K, L.k_norm);
-            K = ggml_rope_ext(gA, K, pos_chunk, nullptr, D,
-                              GGML_ROPE_TYPE_NEOX, 0,
-                              rope_b, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
             ggml_tensor * V = ggml_mul_mat(gA, L.wv, h_norm);
             V = ggml_reshape_3d(gA, V, D, Hk, cl);
@@ -290,6 +291,15 @@ bool forward_qwen3_0p6b_drafter(
             ggml_tensor * K_dst = ggml_view_3d(gA, K_curr_v[il].t, D, Hk, cl,
                                                kv_esz * D, kv_esz * D * Hk,
                                                (size_t)cs * kv_esz * D * Hk);
+            // Capture pre-RoPE K for the NoPE tail-score (content-only attention,
+            // no positional distance decay — makes needle content matching reliable).
+            ggml_tensor * K_nr_dst = ggml_view_3d(gA, K_norope_v[il].t, D, Hk, cl,
+                                                   kv_esz * D, kv_esz * D * Hk,
+                                                   (size_t)cs * kv_esz * D * Hk);
+            ggml_build_forward_expand(gfA, ggml_cpy(gA, K, K_nr_dst));
+            K = ggml_rope_ext(gA, K, pos_chunk, nullptr, D,
+                              GGML_ROPE_TYPE_NEOX, 0,
+                              rope_b, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
             ggml_tensor * V_dst = ggml_view_3d(gA, V_curr_v[il].t, D, Hk, cl,
                                                kv_esz * D, kv_esz * D * Hk,
                                                (size_t)cs * kv_esz * D * Hk);
@@ -426,6 +436,30 @@ bool forward_qwen3_0p6b_drafter(
 
     ggml_gallocr_free(galloc);
 
+    // Compute per-token ||h||^2 from final hidden_buf [hidden, S] F32.
+    // ggml_sum_rows reduces the hidden dimension → [1, S].
+    // Cheap: S*4 bytes GPU→CPU (512KB at 128K tokens).
+    {
+        ggml_init_params ip{};
+        ip.mem_size = ggml_tensor_overhead() * 8 + ggml_graph_overhead();
+        ip.no_alloc = true;
+        ggml_context * gn = ggml_init(ip);
+        ggml_tensor * h_sq   = ggml_sqr(gn, hidden_buf.t);
+        ggml_tensor * h_ssum = ggml_sum_rows(gn, h_sq);
+        ggml_set_output(h_ssum);
+        ggml_cgraph * gf_n = ggml_new_graph(gn);
+        ggml_build_forward_expand(gf_n, h_ssum);
+        ggml_gallocr_t ng = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(w.backend));
+        ggml_gallocr_alloc_graph(ng, gf_n);
+        ggml_backend_graph_compute(w.backend, gf_n);
+        norm_scores.resize((size_t)S);
+        ggml_backend_tensor_get(h_ssum, norm_scores.data(), 0,
+                                (size_t)S * sizeof(float));
+        ggml_gallocr_free(ng);
+        ggml_free(gn);
+    }
+
     auto t_fwd_end = std::chrono::steady_clock::now();
     double t_fwd = std::chrono::duration<double>(t_fwd_end - t_total_start).count();
 
@@ -440,7 +474,7 @@ bool forward_qwen3_0p6b_drafter(
         ggml_context * gctx = ggml_init(ip);
 
         ggml_tensor * K_f32 = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, D, Hk, S);
-        ggml_tensor * K_cast = ggml_cpy(gctx, K_curr_v[il].t, K_f32);
+        ggml_tensor * K_cast = ggml_cpy(gctx, K_norope_v[il].t, K_f32);
         ggml_tensor * K_perm = ggml_cont(gctx,
             ggml_permute(gctx, K_cast, 0, 2, 1, 3));
         ggml_tensor * K_score = K_perm;

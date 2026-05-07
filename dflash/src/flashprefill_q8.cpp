@@ -103,7 +103,11 @@ int flash_prefill_forward_q8(
         ggml_tensor * Q_chunk = ggml_view_3d(ctx, Q_full, D, H, cl,
                                              esz * D, esz * D * H,
                                              (size_t)cs * esz * D * H);
-        ggml_tensor * Q_fa = ggml_cont(ctx, ggml_permute(ctx, Q_chunk, 0, 2, 1, 3));
+        // ggml-hip flash_attn_ext requires Q in F32; cast if BF16/F16.
+        ggml_tensor * Q_perm = ggml_cont(ctx, ggml_permute(ctx, Q_chunk, 0, 2, 1, 3));
+        ggml_tensor * Q_fa = (Q_perm->type != GGML_TYPE_F32)
+                             ? ggml_cast(ctx, Q_perm, GGML_TYPE_F32)
+                             : Q_perm;
 
         // K/V: [D, Hk, kv_len] view, then permute → [D, kv_len, Hk] for FA
         ggml_tensor * K_view = ggml_view_3d(ctx, K_full, D, Hk, kv_len,
