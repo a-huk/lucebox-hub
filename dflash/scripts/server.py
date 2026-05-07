@@ -39,6 +39,57 @@ from _prefill_hook import (
 from prefix_cache import DaemonStdoutBus, PrefixCache
 
 
+class ThinkSplitter:
+    """Stateful <think>...</think> router for streaming output.
+
+    feed() routes each decoded token into reasoning or content buckets,
+    buffering only the few bytes needed to detect tag boundaries.
+    flush() drains any remaining lookahead at end of stream.
+    """
+    _OPEN = "<think>"
+    _CLOSE = "</think>"
+
+    def __init__(self):
+        self._buf = ""
+        self._state = "pre"  # "pre" | "think" | "content"
+
+    def feed(self, text: str) -> tuple[str, str]:
+        self._buf += text
+        reasoning = ""
+        content = ""
+        while self._buf:
+            if self._state == "pre":
+                idx = self._buf.find(self._OPEN)
+                if idx == -1:
+                    safe = max(0, len(self._buf) - (len(self._OPEN) - 1))
+                    content += self._buf[:safe]
+                    self._buf = self._buf[safe:]
+                    break
+                content += self._buf[:idx]
+                self._buf = self._buf[idx + len(self._OPEN):]
+                self._state = "think"
+            elif self._state == "think":
+                idx = self._buf.find(self._CLOSE)
+                if idx == -1:
+                    safe = max(0, len(self._buf) - (len(self._CLOSE) - 1))
+                    reasoning += self._buf[:safe]
+                    self._buf = self._buf[safe:]
+                    break
+                reasoning += self._buf[:idx]
+                self._buf = self._buf[idx + len(self._CLOSE):]
+                self._state = "content"
+            else:
+                content += self._buf
+                self._buf = ""
+        return reasoning, content
+
+    def flush(self) -> tuple[str, str]:
+        text, self._buf = self._buf, ""
+        if self._state == "think":
+            return text, ""
+        return "", text
+
+
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TARGET = Path(os.environ.get(
     "DFLASH_TARGET",
@@ -142,7 +193,8 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
               prefill_cfg: PrefillConfig | None = None,
               drafter_tokenizer: AutoTokenizer | None = None,
               prefix_cache_slots: int = 4,
-              prefill_cache_slots: int = 4) -> FastAPI:
+              prefill_cache_slots: int = 4,
+              reasoning_content: bool = False) -> FastAPI:
     import asyncio
     app = FastAPI(title="Luce DFlash OpenAI server")
 
@@ -471,16 +523,44 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                     yield f"data: {json.dumps(head)}\n\n"
 
                     try:
-                        async for tok_id in _astream_tokens(r_pipe, gen_len):
-                            chunk = {
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created, "model": MODEL_NAME,
-                                "choices": [{"index": 0,
-                                             "delta": {"content": tokenizer.decode([tok_id])},
-                                             "finish_reason": None}],
-                            }
-                            yield f"data: {json.dumps(chunk)}\n\n"
+                        if reasoning_content:
+                            splitter = ThinkSplitter()
+                            async for tok_id in _astream_tokens(r_pipe, gen_len):
+                                r_d, c_d = splitter.feed(tokenizer.decode([tok_id]))
+                                for field, text in (("reasoning_content", r_d), ("content", c_d)):
+                                    if text:
+                                        chunk = {
+                                            "id": completion_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created, "model": MODEL_NAME,
+                                            "choices": [{"index": 0,
+                                                         "delta": {field: text},
+                                                         "finish_reason": None}],
+                                        }
+                                        yield f"data: {json.dumps(chunk)}\n\n"
+                            r_d, c_d = splitter.flush()
+                            for field, text in (("reasoning_content", r_d), ("content", c_d)):
+                                if text:
+                                    chunk = {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created, "model": MODEL_NAME,
+                                        "choices": [{"index": 0,
+                                                     "delta": {field: text},
+                                                     "finish_reason": None}],
+                                    }
+                                    yield f"data: {json.dumps(chunk)}\n\n"
+                        else:
+                            async for tok_id in _astream_tokens(r_pipe, gen_len):
+                                chunk = {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created, "model": MODEL_NAME,
+                                    "choices": [{"index": 0,
+                                                 "delta": {"content": tokenizer.decode([tok_id])},
+                                                 "finish_reason": None}],
+                                }
+                                yield f"data: {json.dumps(chunk)}\n\n"
                     finally:
                         if full_hit is None:
                             try: cur_bin.unlink()
@@ -566,16 +646,20 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
             except Exception: pass
 
         text = tokenizer.decode(tokens, skip_special_tokens=True)
+        if reasoning_content and "<think>" in text and "</think>" in text:
+            think_start = text.index("<think>") + len("<think>")
+            think_end = text.index("</think>")
+            msg = {"role": "assistant",
+                   "reasoning_content": text[think_start:think_end],
+                   "content": text[think_end + len("</think>"):].lstrip("\n")}
+        else:
+            msg = {"role": "assistant", "content": text}
         return JSONResponse({
             "id": completion_id,
             "object": "chat.completion",
             "created": created,
             "model": MODEL_NAME,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
-            }],
+            "choices": [{"index": 0, "message": msg, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": prompt_len,
                       "completion_tokens": len(tokens),
                       "total_tokens": prompt_len + len(tokens)},
@@ -650,7 +734,6 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                         },
                     }
                     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
-                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
 
                     try:
                         _write_cmd(cmd_line)
@@ -660,14 +743,64 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
 
                     out_tokens = 0
                     try:
-                        async for tok_id in _astream_tokens(r_pipe, gen_len):
-                            out_tokens += 1
-                            delta = {
-                                "type": "content_block_delta", "index": 0,
-                                "delta": {"type": "text_delta",
-                                          "text": tokenizer.decode([tok_id])},
-                            }
-                            yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
+                        if reasoning_content:
+                            splitter = ThinkSplitter()
+                            block_idx = -1
+                            block_type = None  # "think" | "text"
+
+                            async def _anthropic_emit(dtype, text):
+                                nonlocal block_idx, block_type
+                                if not text:
+                                    return
+                                if block_type != dtype:
+                                    if block_type is not None:
+                                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_idx})}\n\n"
+                                        block_idx += 1
+                                    else:
+                                        block_idx = 0
+                                    block_type = dtype
+                                    if dtype == "think":
+                                        cb = {"type": "content_block_start", "index": block_idx,
+                                              "content_block": {"type": "thinking", "thinking": ""}}
+                                    else:
+                                        cb = {"type": "content_block_start", "index": block_idx,
+                                              "content_block": {"type": "text", "text": ""}}
+                                    yield f"event: content_block_start\ndata: {json.dumps(cb)}\n\n"
+                                if dtype == "think":
+                                    d = {"type": "content_block_delta", "index": block_idx,
+                                         "delta": {"type": "thinking_delta", "thinking": text}}
+                                else:
+                                    d = {"type": "content_block_delta", "index": block_idx,
+                                         "delta": {"type": "text_delta", "text": text}}
+                                yield f"event: content_block_delta\ndata: {json.dumps(d)}\n\n"
+
+                            async for tok_id in _astream_tokens(r_pipe, gen_len):
+                                out_tokens += 1
+                                r_d, c_d = splitter.feed(tokenizer.decode([tok_id]))
+                                async for ev in _anthropic_emit("think", r_d):
+                                    yield ev
+                                async for ev in _anthropic_emit("text", c_d):
+                                    yield ev
+                            r_d, c_d = splitter.flush()
+                            async for ev in _anthropic_emit("think", r_d):
+                                yield ev
+                            async for ev in _anthropic_emit("text", c_d):
+                                yield ev
+                            if block_idx == -1:
+                                block_idx = 0
+                                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_idx})}\n\n"
+                        else:
+                            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                            async for tok_id in _astream_tokens(r_pipe, gen_len):
+                                out_tokens += 1
+                                delta = {
+                                    "type": "content_block_delta", "index": 0,
+                                    "delta": {"type": "text_delta",
+                                              "text": tokenizer.decode([tok_id])},
+                                }
+                                yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
+                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
                     finally:
                         if full_hit is None:
                             try: cur_bin.unlink()
@@ -683,7 +816,6 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                     elif snap_prep:
                         prefix_cache.confirm_inline_snap(*snap_prep, cur_ids)
 
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
                     msg_delta = {
                         "type": "message_delta",
                         "delta": {"stop_reason": "end_turn", "stop_sequence": None},
@@ -756,12 +888,21 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
             except Exception: pass
 
         text = tokenizer.decode(tokens, skip_special_tokens=True)
+        if reasoning_content and "<think>" in text and "</think>" in text:
+            think_start = text.index("<think>") + len("<think>")
+            think_end = text.index("</think>")
+            content_blocks = [
+                {"type": "thinking", "thinking": text[think_start:think_end]},
+                {"type": "text", "text": text[think_end + len("</think>"):].lstrip("\n")},
+            ]
+        else:
+            content_blocks = [{"type": "text", "text": text}]
         return JSONResponse({
             "id": msg_id,
             "type": "message",
             "role": "assistant",
             "model": req.model or MODEL_NAME,
-            "content": [{"type": "text", "text": text}],
+            "content": content_blocks,
             "stop_reason": "end_turn",
             "stop_sequence": None,
             "usage": {"input_tokens": prompt_len,
@@ -795,6 +936,9 @@ def main():
     ap.add_argument("--tokenizer", type=str, default=None)
     ap.add_argument("--prefix-cache-slots", type=int, default=4)
     ap.add_argument("--prefill-cache-slots", type=int, default=4)
+    ap.add_argument("--reasoning-content", action="store_true",
+                    help="Split <think>…</think> into reasoning_content (OpenAI) "
+                         "/ thinking block (Anthropic) instead of leaving tags in content.")
     ap.add_argument("--daemon", action="store_true")
     add_cli_flags(ap)
     args = ap.parse_args()
@@ -841,7 +985,8 @@ def main():
                     prefill_cfg=prefill_cfg if prefill_cfg.enabled else None,
                     drafter_tokenizer=drafter_tokenizer,
                     prefix_cache_slots=args.prefix_cache_slots,
-                    prefill_cache_slots=args.prefill_cache_slots)
+                    prefill_cache_slots=args.prefill_cache_slots,
+                    reasoning_content=args.reasoning_content)
 
     import uvicorn
     print(f"Luce DFlash OpenAI server on http://{args.host}:{args.port}")
